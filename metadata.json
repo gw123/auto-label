@@ -1,0 +1,5 @@
+{
+  "name": "YOLOv11 Studio",
+  "description": "A professional-grade image annotation tool for YOLOv11 model training, featuring AI-assisted labeling via Gemini, data management, and export capabilities.",
+  "requestFramePermissions": []
+}
