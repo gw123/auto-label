@@ -7,15 +7,26 @@ export interface BBox {
   h: number; // Normalized height (0-1)
 }
 
-export interface DatasetImage {
+// Lightweight metadata for the list view (State)
+export interface ImageMetadata {
   id: string;
-  file: File;
-  url: string;
   name: string;
   width: number;
   height: number;
-  annotations: BBox[];
   status: 'unlabeled' | 'in-progress' | 'done';
+  annotationCount: number;
+  thumbnail?: string; // Optional base64 thumb if needed, usually avoid for 10k
+}
+
+// Full object stored in IndexedDB
+export interface StoredImage extends ImageMetadata {
+  blob: Blob; // The raw image data
+  annotations: BBox[];
+}
+
+// Runtime object for Canvas (loaded from DB)
+export interface LoadedImage extends StoredImage {
+  url: string; // ObjectURL for <img> tag
 }
 
 export interface LabelClass {

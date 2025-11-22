@@ -1,9 +1,10 @@
-import React, { useRef, useState, MouseEvent } from 'react';
-import { BBox, DatasetImage, LabelClass, ToolMode } from '../types';
+import React, { useRef, useState, MouseEvent, useEffect, useCallback } from 'react';
+import { Undo, Redo } from 'lucide-react';
+import { BBox, LoadedImage, LabelClass, ToolMode } from '../types';
 import { yoloToSvg, svgToYolo } from '../services/yoloService';
 
 interface CanvasProps {
-  image: DatasetImage;
+  image: LoadedImage;
   currentLabelId: string;
   labels: LabelClass[];
   mode: ToolMode;
@@ -13,7 +14,7 @@ interface CanvasProps {
   onPanChange: (x: number, y: number) => void;
   onSelectAnnotation: (id: string | null) => void;
   selectedAnnotationId: string | null;
-  onMagicBoxSelect?: (rect: {x: number, y: number, w: number, h: number}) => void;
+  snapPixelDistance: number;
 }
 
 type ResizeHandleType = 'tl' | 'tr' | 'bl' | 'br';
@@ -29,7 +30,7 @@ export const Canvas: React.FC<CanvasProps> = ({
   onPanChange,
   onSelectAnnotation,
   selectedAnnotationId,
-  onMagicBoxSelect
+  snapPixelDistance,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   
@@ -47,8 +48,91 @@ export const Canvas: React.FC<CanvasProps> = ({
   // Snapping State
   const [activeSnapLines, setActiveSnapLines] = useState<{x: number | null, y: number | null}>({x: null, y: null});
   const [initialMoveRect, setInitialMoveRect] = useState<{x: number, y: number, w: number, h: number} | null>(null);
+
+  // --- History State ---
+  const [undoStack, setUndoStack] = useState<BBox[][]>([]);
+  const [redoStack, setRedoStack] = useState<BBox[][]>([]);
   
-  const SNAP_DIST_PX = 12; // Snap distance in screen pixels
+  // Refs to track state for "smart" history (avoiding rapid updates during drag)
+  const prevAnnotationsRef = useRef<BBox[]>(image.annotations);
+  const prevImageIdRef = useRef<string>(image.id);
+  const isHistoryAction = useRef<boolean>(false);
+  const dragStartAnnotationsRef = useRef<BBox[]>(image.annotations);
+  const isUndoRedo = useRef<boolean>(false);
+
+  const SNAP_DIST_PX = snapPixelDistance; 
+
+  // --- History Logic ---
+  useEffect(() => {
+    // 1. Image Switch: Reset History
+    if (image.id !== prevImageIdRef.current) {
+      setUndoStack([]);
+      setRedoStack([]);
+      prevImageIdRef.current = image.id;
+      prevAnnotationsRef.current = image.annotations;
+      return;
+    }
+
+    // 2. Change Detection
+    if (image.annotations !== prevAnnotationsRef.current) {
+      // If we are currently dragging (modifying), we suppress the automatic history push
+      // We will manually push the start-state to history on MouseUp instead.
+      if (isHistoryAction.current) {
+        return;
+      }
+
+      // If this change wasn't caused by our own undo/redo function (e.g. Delete key, Auto Label, Draw)
+      if (!isUndoRedo.current) {
+         setUndoStack(prev => [...prev, prevAnnotationsRef.current]);
+         setRedoStack([]);
+      }
+
+      prevAnnotationsRef.current = image.annotations;
+      isUndoRedo.current = false;
+    }
+  }, [image.id, image.annotations]);
+
+  const performUndo = useCallback(() => {
+    if (undoStack.length === 0) return;
+    const prevState = undoStack[undoStack.length - 1];
+    
+    isUndoRedo.current = true;
+    setRedoStack(prev => [...prev, image.annotations]);
+    setUndoStack(prev => prev.slice(0, -1));
+    onUpdateAnnotations(prevState);
+  }, [undoStack, image.annotations, onUpdateAnnotations]);
+
+  const performRedo = useCallback(() => {
+    if (redoStack.length === 0) return;
+    const nextState = redoStack[redoStack.length - 1];
+    
+    isUndoRedo.current = true;
+    setUndoStack(prev => [...prev, image.annotations]);
+    setRedoStack(prev => prev.slice(0, -1));
+    onUpdateAnnotations(nextState);
+  }, [redoStack, image.annotations, onUpdateAnnotations]);
+
+  // Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+         e.preventDefault();
+         e.stopPropagation();
+         if (e.shiftKey) performRedo();
+         else performUndo();
+       }
+       else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+         e.preventDefault();
+         e.stopPropagation();
+         performRedo();
+       }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [performUndo, performRedo]);
+
 
   // --- Helper: Get all relevant snap lines (x and y) ---
   const getSnapLines = (excludeId: string | null) => {
@@ -61,16 +145,15 @@ export const Canvas: React.FC<CanvasProps> = ({
       xLines.push(rect.x, rect.x + rect.w);
       yLines.push(rect.y, rect.y + rect.h);
     });
-    // Sort for easier debugging/logic if needed, though not strictly required for finder
     return { xLines, yLines };
   };
 
   // --- Helper: Find closest snap line within threshold ---
   const getClosestSnap = (val: number, lines: number[], threshold: number) => {
+    if (SNAP_DIST_PX <= 0) return { val, snapped: false };
     let closest = val;
     let snapped = false;
     let minD = threshold;
-    
     lines.forEach(line => {
       const d = Math.abs(val - line);
       if (d < minD) {
@@ -86,7 +169,6 @@ export const Canvas: React.FC<CanvasProps> = ({
   const getMousePos = (e: MouseEvent) => {
     if (!containerRef.current) return { x: 0, y: 0 };
     const rect = containerRef.current.getBoundingClientRect();
-    // Adjust for zoom and pan to get Image Space Coordinates
     const x = (e.clientX - rect.left - pan.x) / zoom;
     const y = (e.clientY - rect.top - pan.y) / zoom;
     return { x, y };
@@ -95,27 +177,31 @@ export const Canvas: React.FC<CanvasProps> = ({
   const handleMouseDown = (e: MouseEvent) => {
     const { x, y } = getMousePos(e);
 
+    // Start History Action Snapshot
+    // For DRAW or SELECT (drag), we flag that an interaction started.
+    // This prevents useEffect from pushing intermediate states during drag.
+    if (mode === ToolMode.DRAW || mode === ToolMode.SELECT) {
+        dragStartAnnotationsRef.current = image.annotations;
+        isHistoryAction.current = true; 
+    }
+
     if (mode === ToolMode.PAN) {
       setIsDragging(true);
-      setDragStart({ x: e.clientX, y: e.clientY }); // Screen coords for panning
+      setDragStart({ x: e.clientX, y: e.clientY }); 
       return;
     }
 
-    // If clicking on empty space for creation
     if (mode === ToolMode.DRAW || mode === ToolMode.MAGIC_BOX) {
       setIsDragging(true);
-      // For drawing, we start with 0 dims
       setActiveCreation({ x, y, w: 0, h: 0 });
-      setDragStart({ x, y }); // Image coords for drawing
+      setDragStart({ x, y }); 
       onSelectAnnotation(null);
     } else if (mode === ToolMode.SELECT) {
-      // Deselect if clicking empty space (propagation stopped by annotation click)
       onSelectAnnotation(null);
     }
   };
 
   const handleMouseMove = (e: MouseEvent) => {
-    // 1. Handle Panning (No snapping)
     if (mode === ToolMode.PAN && isDragging && dragStart) {
       const dx = e.clientX - dragStart.x;
       const dy = e.clientY - dragStart.y;
@@ -125,317 +211,247 @@ export const Canvas: React.FC<CanvasProps> = ({
     }
 
     const { x, y } = getMousePos(e);
-    
-    // Calculate threshold in Image Space
-    // 10 screen pixels / zoom = X image pixels
     const threshold = SNAP_DIST_PX / zoom;
     
     let snapXVisual: number | null = null;
     let snapYVisual: number | null = null;
 
-    // 2. Handle Creating New Box (DRAW or MAGIC)
-    if ((mode === ToolMode.DRAW || mode === ToolMode.MAGIC_BOX) && isDragging && dragStart) {
+    if (mode === ToolMode.DRAW && isDragging && dragStart) {
       const { xLines, yLines } = getSnapLines(null);
-      
-      // We drag from dragStart to current (x,y). 
-      // We want to snap the *current* cursor position to lines.
       const sx = getClosestSnap(x, xLines, threshold);
       const sy = getClosestSnap(y, yLines, threshold);
-      
       if (sx.snapped) snapXVisual = sx.val;
       if (sy.snapped) snapYVisual = sy.val;
-      
       const currentX = sx.val;
       const currentY = sy.val;
-
-      // Calculate rect based on start and current (snapped)
       const minX = Math.min(dragStart.x, currentX);
       const minY = Math.min(dragStart.y, currentY);
       const w = Math.abs(currentX - dragStart.x);
       const h = Math.abs(currentY - dragStart.y);
-      
       setActiveCreation({ x: minX, y: minY, w, h });
       setActiveSnapLines({ x: snapXVisual, y: snapYVisual });
       return;
     }
 
-    // 3. Handle Resizing Existing Box
     if (mode === ToolMode.SELECT && resizeHandle && selectedAnnotationId) {
-      const { xLines, yLines } = getSnapLines(selectedAnnotationId);
-      
-      // Snap cursor position
-      const sx = getClosestSnap(x, xLines, threshold);
-      const sy = getClosestSnap(y, yLines, threshold);
-      
-      if (sx.snapped) snapXVisual = sx.val;
-      if (sy.snapped) snapYVisual = sy.val;
-      
-      const effX = sx.val;
-      const effY = sy.val;
-
       const ann = image.annotations.find(a => a.id === selectedAnnotationId);
       if (ann) {
         const rect = yoloToSvg(ann, image.width, image.height);
-        let newX = rect.x;
-        let newY = rect.y;
-        let newW = rect.w;
-        let newH = rect.h;
+        const { xLines, yLines } = getSnapLines(selectedAnnotationId);
+        let newX = rect.x, newY = rect.y, newW = rect.w, newH = rect.h;
+        const sx = getClosestSnap(x, xLines, threshold);
+        const sy = getClosestSnap(y, yLines, threshold);
+        if (sx.snapped) snapXVisual = sx.val;
+        if (sy.snapped) snapYVisual = sy.val;
+        const mx = sx.val, my = sy.val;
 
-        // Adjust dimensions based on handle
-        if (resizeHandle === 'tl') {
-          const brX = rect.x + rect.w;
-          const brY = rect.y + rect.h;
-          newX = Math.min(effX, brX - 5);
-          newY = Math.min(effY, brY - 5);
-          newW = brX - newX;
-          newH = brY - newY;
-        } else if (resizeHandle === 'tr') {
-          const blX = rect.x;
-          const blY = rect.y + rect.h;
-          newY = Math.min(effY, blY - 5);
-          newW = Math.max(effX - blX, 5);
-          newH = blY - newY;
-        } else if (resizeHandle === 'bl') {
-          const trX = rect.x + rect.w;
-          const trY = rect.y;
-          newX = Math.min(effX, trX - 5);
-          newW = trX - newX;
-          newH = Math.max(effY - trY, 5);
-        } else if (resizeHandle === 'br') {
-          const tlX = rect.x;
-          const tlY = rect.y;
-          newW = Math.max(effX - tlX, 5);
-          newH = Math.max(effY - tlY, 5);
+        if (resizeHandle === 'tl') { newW = (rect.x + rect.w) - mx; newH = (rect.y + rect.h) - my; newX = mx; newY = my; }
+        else if (resizeHandle === 'tr') { newW = mx - rect.x; newH = (rect.y + rect.h) - my; newY = my; }
+        else if (resizeHandle === 'bl') { newW = (rect.x + rect.w) - mx; newH = my - rect.y; newX = mx; }
+        else if (resizeHandle === 'br') { newW = mx - rect.x; newH = my - rect.y; }
+
+        if (newW > 0 && newH > 0) {
+          const newYolo = svgToYolo(newX, newY, newW, newH, image.width, image.height);
+          const updated = image.annotations.map(a => a.id === selectedAnnotationId ? { ...a, ...newYolo } : a);
+          onUpdateAnnotations(updated);
         }
-
-        const newYolo = svgToYolo(newX, newY, newW, newH, image.width, image.height);
-        const updatedAnns = image.annotations.map(a => 
-          a.id === ann.id ? { ...a, ...newYolo } : a
-        );
-        onUpdateAnnotations(updatedAnns);
+        setActiveSnapLines({ x: snapXVisual, y: snapYVisual });
       }
-      setActiveSnapLines({ x: snapXVisual, y: snapYVisual });
       return;
     }
 
-    // 4. Handle Moving Existing Box
-    if (mode === ToolMode.SELECT && isDragging && draggingAnnotationId && initialMoveRect && dragStart) {
-      const { xLines, yLines } = getSnapLines(draggingAnnotationId);
-      
-      // Delta from start of drag
+    if (mode === ToolMode.SELECT && draggingAnnotationId && initialMoveRect && dragStart) {
       const dx = x - dragStart.x;
       const dy = y - dragStart.y;
+      let newX = initialMoveRect.x + dx;
+      let newY = initialMoveRect.y + dy;
+      const { xLines, yLines } = getSnapLines(draggingAnnotationId);
+      const snapL = getClosestSnap(newX, xLines, threshold);
+      const snapR = getClosestSnap(newX + initialMoveRect.w, xLines, threshold);
+      const snapT = getClosestSnap(newY, yLines, threshold);
+      const snapB = getClosestSnap(newY + initialMoveRect.h, yLines, threshold);
+      if (snapL.snapped) { newX = snapL.val; snapXVisual = snapL.val; }
+      else if (snapR.snapped) { newX = snapR.val - initialMoveRect.w; snapXVisual = snapR.val; }
+      if (snapT.snapped) { newY = snapT.val; snapYVisual = snapT.val; }
+      else if (snapB.snapped) { newY = snapB.val - initialMoveRect.h; snapYVisual = snapB.val; }
 
-      // Raw proposed position
-      let proposedX = initialMoveRect.x + dx;
-      let proposedY = initialMoveRect.y + dy;
-
-      // Check snaps for Left edge
-      const snapLeft = getClosestSnap(proposedX, xLines, threshold);
-      // Check snaps for Right edge
-      const snapRight = getClosestSnap(proposedX + initialMoveRect.w, xLines, threshold);
-      
-      if (snapLeft.snapped) {
-        proposedX = snapLeft.val;
-        snapXVisual = snapLeft.val;
-      } else if (snapRight.snapped) {
-        proposedX = snapRight.val - initialMoveRect.w;
-        snapXVisual = snapRight.val;
-      }
-
-      // Check snaps for Top edge
-      const snapTop = getClosestSnap(proposedY, yLines, threshold);
-      // Check snaps for Bottom edge
-      const snapBottom = getClosestSnap(proposedY + initialMoveRect.h, yLines, threshold);
-
-      if (snapTop.snapped) {
-        proposedY = snapTop.val;
-        snapYVisual = snapTop.val;
-      } else if (snapBottom.snapped) {
-        proposedY = snapBottom.val - initialMoveRect.h;
-        snapYVisual = snapBottom.val;
-      }
-
-      // Update Annotation
-      const newYolo = svgToYolo(proposedX, proposedY, initialMoveRect.w, initialMoveRect.h, image.width, image.height);
-      
-      const newAnns = image.annotations.map(a => {
-        if (a.id === draggingAnnotationId) {
-          return { ...a, ...newYolo };
-        }
-        return a;
-      });
-      
-      onUpdateAnnotations(newAnns);
+      const newYolo = svgToYolo(newX, newY, initialMoveRect.w, initialMoveRect.h, image.width, image.height);
+      const updated = image.annotations.map(a => a.id === draggingAnnotationId ? { ...a, ...newYolo } : a);
+      onUpdateAnnotations(updated);
       setActiveSnapLines({ x: snapXVisual, y: snapYVisual });
+    }
+
+    if (!isDragging && !resizeHandle && !draggingAnnotationId) {
+        setActiveSnapLines({ x: null, y: null });
     }
   };
 
   const handleMouseUp = () => {
-    // Finalize Creation
-    if (activeCreation) {
-      if (activeCreation.w > 5 && activeCreation.h > 5) {
-        
-        if (mode === ToolMode.DRAW) {
-          // Standard Draw
-          const yoloBox = svgToYolo(
-            activeCreation.x, activeCreation.y, 
-            activeCreation.w, activeCreation.h, 
-            image.width, image.height
-          );
-          const newAnn: BBox = {
-            ...yoloBox,
-            id: crypto.randomUUID(),
-            labelId: currentLabelId
-          };
-          onUpdateAnnotations([...image.annotations, newAnn]);
-          onSelectAnnotation(newAnn.id);
-
-        } else if (mode === ToolMode.MAGIC_BOX && onMagicBoxSelect) {
-          // Magic Box - Defer to parent
-          onMagicBoxSelect(activeCreation);
+    // Commit History for Move/Resize interactions
+    if (isHistoryAction.current) {
+        // If the annotations actually changed during this drag
+        if (image.annotations !== dragStartAnnotationsRef.current) {
+             setUndoStack(prev => [...prev, dragStartAnnotationsRef.current]);
+             setRedoStack([]);
+             // Manually update prevAnnotations so useEffect doesn't double-add
+             prevAnnotationsRef.current = image.annotations;
         }
+        isHistoryAction.current = false;
+    }
+
+    if (mode === ToolMode.DRAW && activeCreation) {
+      if (activeCreation.w > 5 && activeCreation.h > 5) {
+        const newYolo = svgToYolo(activeCreation.x, activeCreation.y, activeCreation.w, activeCreation.h, image.width, image.height);
+        const newAnn: BBox = {
+          id: crypto.randomUUID(),
+          labelId: currentLabelId,
+          ...newYolo
+        };
+        onUpdateAnnotations([...image.annotations, newAnn]);
+        onSelectAnnotation(newAnn.id);
       }
-      setActiveCreation(null);
     }
 
     setIsDragging(false);
     setDragStart(null);
+    setActiveCreation(null);
     setDraggingAnnotationId(null);
-    setInitialMoveRect(null);
     setResizeHandle(null);
-    setActiveSnapLines({ x: null, y: null });
+    setInitialMoveRect(null);
+    setActiveSnapLines({x: null, y: null});
   };
 
-  // Annotation Interactions
-  const handleAnnMouseDown = (e: MouseEvent, id: string) => {
+  const handleAnnotationMouseDown = (e: MouseEvent, id: string) => {
+    if (mode !== ToolMode.SELECT) return;
     e.stopPropagation();
-    if (mode === ToolMode.SELECT) {
-      onSelectAnnotation(id);
-      setIsDragging(true);
-      
+    onSelectAnnotation(id);
+    
+    const ann = image.annotations.find(a => a.id === id);
+    if (ann) {
+      // Start Drag History
+      dragStartAnnotationsRef.current = image.annotations;
+      isHistoryAction.current = true;
+
+      setDraggingAnnotationId(id);
+      const rect = yoloToSvg(ann, image.width, image.height);
+      setInitialMoveRect(rect);
       const { x, y } = getMousePos(e);
-      setDragStart({ x, y }); // Store image coord start
-      
-      // Store initial rect state for stable moving calculation
-      const ann = image.annotations.find(a => a.id === id);
-      if (ann) {
-        setDraggingAnnotationId(id);
-        setInitialMoveRect(yoloToSvg(ann, image.width, image.height));
-      }
+      setDragStart({ x, y });
     }
   };
 
-  const handleResizeStart = (e: MouseEvent, handle: ResizeHandleType) => {
-    e.stopPropagation(); 
-    setResizeHandle(handle);
-    setIsDragging(true);
-    // Drag start isn't strictly needed for resize logic here as we just track mouse pos relative to rect corners,
-    // but keeping consistent state helps.
-  };
+  const handleResizeMouseDown = (e: MouseEvent, handle: ResizeHandleType, id: string) => {
+    if (mode !== ToolMode.SELECT) return;
+    e.stopPropagation();
+    
+    // Start Resize History
+    dragStartAnnotationsRef.current = image.annotations;
+    isHistoryAction.current = true;
 
-  // Determine cursor
-  let cursorClass = '';
-  if (mode === ToolMode.PAN) cursorClass = isDragging ? 'cursor-grabbing' : 'cursor-grab';
-  else if (mode === ToolMode.DRAW || mode === ToolMode.MAGIC_BOX) cursorClass = 'cursor-crosshair';
-  else if (mode === ToolMode.SELECT) cursorClass = 'cursor-default';
+    setResizeHandle(handle);
+    setDraggingAnnotationId(null);
+  };
 
   return (
     <div 
-      className={`relative w-full h-full bg-neutral-900 overflow-hidden ${cursorClass}`}
+      ref={containerRef}
+      className="relative w-full h-full overflow-hidden bg-[#111] cursor-crosshair select-none"
+      onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
       onMouseLeave={handleMouseUp}
     >
-      <div
-        ref={containerRef}
-        className="absolute origin-top-left"
-        style={{
+      <div 
+        className="absolute transform-gpu origin-top-left"
+        style={{ 
           transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
           width: image.width,
           height: image.height
         }}
-        onMouseDown={handleMouseDown}
       >
-        {/* Base Image */}
         <img 
           src={image.url} 
-          alt="workspace" 
-          className="absolute top-0 left-0 select-none pointer-events-none"
-          style={{ width: '100%', height: '100%' }}
+          alt="work" 
+          className="w-full h-full object-contain pointer-events-none select-none" 
           draggable={false}
         />
 
-        {/* SVG Overlay */}
-        <svg 
-          width={image.width} 
-          height={image.height} 
-          className="absolute top-0 left-0"
-        >
-          {/* Snap Lines */}
-          {activeSnapLines.x !== null && (
-            <line x1={activeSnapLines.x} y1={0} x2={activeSnapLines.x} y2={image.height} stroke="#06b6d4" strokeWidth={2/zoom} strokeDasharray={`${5/zoom}, ${5/zoom}`} />
-          )}
-          {activeSnapLines.y !== null && (
-            <line x1={0} y1={activeSnapLines.y} x2={image.width} y2={activeSnapLines.y} stroke="#06b6d4" strokeWidth={2/zoom} strokeDasharray={`${5/zoom}, ${5/zoom}`} />
-          )}
-
-          {/* Existing Annotations */}
+        <svg className="absolute inset-0 w-full h-full pointer-events-none overflow-visible">
           {image.annotations.map(ann => {
-            const { x, y, w, h } = yoloToSvg(ann, image.width, image.height);
+            const rect = yoloToSvg(ann, image.width, image.height);
             const label = labels.find(l => l.id === ann.labelId);
-            const isSelected = selectedAnnotationId === ann.id;
-            const color = label?.color || '#1d4ed8';
+            const isSelected = ann.id === selectedAnnotationId;
+            const color = label?.color || '#fff';
 
             return (
-              <g key={ann.id}>
-                <rect
-                  x={x} y={y} width={w} height={h}
-                  fill={color}
-                  fillOpacity={isSelected ? 0.2 : 0.1}
-                  stroke={color}
-                  strokeWidth={isSelected ? 2 / zoom : 1.5 / zoom}
-                  onMouseDown={(e) => handleAnnMouseDown(e, ann.id)}
-                  className={`transition-all ${mode === ToolMode.SELECT ? 'cursor-move' : ''}`}
+              <g key={ann.id} className="pointer-events-auto" onMouseDown={(e) => handleAnnotationMouseDown(e, ann.id)}>
+                {isSelected && (
+                   <rect x={rect.x-2} y={rect.y-2} width={rect.w+4} height={rect.h+4} fill="none" stroke="white" strokeWidth="2" opacity="0.5" />
+                )}
+                <rect 
+                  x={rect.x} y={rect.y} width={rect.w} height={rect.h} 
+                  fill={color} fillOpacity={isSelected ? 0.2 : 0.1}
+                  stroke={color} strokeWidth={isSelected ? 2 : 1.5}
+                  vectorEffect="non-scaling-stroke"
                 />
-                 <text
-                    x={x}
-                    y={y - 5 / zoom}
-                    fill={color}
-                    fontSize={14 / zoom}
-                    fontWeight="bold"
-                    className="select-none pointer-events-none"
-                    style={{ textShadow: '0px 1px 2px black' }}
-                  >
-                    {label?.name}
-                  </text>
-                
-                {/* Resize Handles */}
+                <g transform={`translate(${rect.x}, ${rect.y - 4})`}>
+                   <rect x="0" y="-16" width={label?.name.length ? label.name.length * 8 + 10 : 40} height="16" fill={color} rx="2" />
+                   <text x="4" y="-4" fill="white" fontSize="10" fontWeight="bold" fontFamily="monospace">{label?.name}</text>
+                </g>
+
                 {isSelected && mode === ToolMode.SELECT && (
                   <>
-                    <circle cx={x} cy={y} r={5/zoom} fill="white" stroke={color} strokeWidth={1/zoom} className="cursor-nwse-resize" onMouseDown={(e) => handleResizeStart(e, 'tl')} />
-                    <circle cx={x+w} cy={y} r={5/zoom} fill="white" stroke={color} strokeWidth={1/zoom} className="cursor-nesw-resize" onMouseDown={(e) => handleResizeStart(e, 'tr')} />
-                    <circle cx={x} cy={y+h} r={5/zoom} fill="white" stroke={color} strokeWidth={1/zoom} className="cursor-nesw-resize" onMouseDown={(e) => handleResizeStart(e, 'bl')} />
-                    <circle cx={x+w} cy={y+h} r={5/zoom} fill="white" stroke={color} strokeWidth={1/zoom} className="cursor-nwse-resize" onMouseDown={(e) => handleResizeStart(e, 'br')} />
+                    <circle cx={rect.x} cy={rect.y} r={4 / zoom} fill="white" stroke={color} strokeWidth={1} className="cursor-nw-resize" onMouseDown={(e) => handleResizeMouseDown(e, 'tl', ann.id)} />
+                    <circle cx={rect.x + rect.w} cy={rect.y} r={4 / zoom} fill="white" stroke={color} strokeWidth={1} className="cursor-ne-resize" onMouseDown={(e) => handleResizeMouseDown(e, 'tr', ann.id)} />
+                    <circle cx={rect.x} cy={rect.y + rect.h} r={4 / zoom} fill="white" stroke={color} strokeWidth={1} className="cursor-sw-resize" onMouseDown={(e) => handleResizeMouseDown(e, 'bl', ann.id)} />
+                    <circle cx={rect.x + rect.w} cy={rect.y + rect.h} r={4 / zoom} fill="white" stroke={color} strokeWidth={1} className="cursor-se-resize" onMouseDown={(e) => handleResizeMouseDown(e, 'br', ann.id)} />
                   </>
                 )}
               </g>
             );
           })}
 
-          {/* Creation Preview Box */}
           {activeCreation && (
-             <rect
-             x={activeCreation.x} y={activeCreation.y} 
-             width={activeCreation.w} height={activeCreation.h}
-             fill={mode === ToolMode.MAGIC_BOX ? "rgba(147, 51, 234, 0.2)" : "rgba(37, 99, 235, 0.3)"}
-             stroke={mode === ToolMode.MAGIC_BOX ? "#9333ea" : "#1d4ed8"}
-             strokeWidth={2 / zoom}
-             strokeDasharray={mode === ToolMode.MAGIC_BOX ? "4 2" : ""}
-             className={mode === ToolMode.MAGIC_BOX ? "animate-pulse" : ""}
-           />
+            <rect 
+              x={activeCreation.x} y={activeCreation.y} width={activeCreation.w} height={activeCreation.h}
+              fill="none" stroke="white" strokeWidth="1" strokeDasharray="4"
+            />
+          )}
+          
+          {activeSnapLines.x !== null && (
+            <line 
+                x1={activeSnapLines.x} y1={0} x2={activeSnapLines.x} y2={image.height} 
+                stroke="#06b6d4" strokeWidth="1.5" strokeDasharray="6 4" 
+            />
+          )}
+          {activeSnapLines.y !== null && (
+            <line 
+                x1={0} y1={activeSnapLines.y} x2={image.width} y2={activeSnapLines.y} 
+                stroke="#06b6d4" strokeWidth="1.5" strokeDasharray="6 4" 
+            />
           )}
         </svg>
+      </div>
+
+      {/* Undo/Redo Floating Controls */}
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-neutral-800/90 backdrop-blur border border-neutral-700 p-1.5 rounded-full flex gap-2 z-20 shadow-xl">
+        <button 
+            className={`p-2 rounded-full hover:bg-white/10 transition-colors ${undoStack.length === 0 ? 'opacity-30 cursor-not-allowed' : ''}`}
+            onClick={(e) => { e.stopPropagation(); performUndo(); }}
+            disabled={undoStack.length === 0}
+            title="Undo (Ctrl+Z)"
+        >
+            <Undo size={16} className="text-neutral-200" />
+        </button>
+        <div className="w-px bg-neutral-600 h-6 my-auto"></div>
+        <button 
+            className={`p-2 rounded-full hover:bg-white/10 transition-colors ${redoStack.length === 0 ? 'opacity-30 cursor-not-allowed' : ''}`}
+            onClick={(e) => { e.stopPropagation(); performRedo(); }}
+            disabled={redoStack.length === 0}
+            title="Redo (Ctrl+Shift+Z)"
+        >
+            <Redo size={16} className="text-neutral-200" />
+        </button>
       </div>
     </div>
   );

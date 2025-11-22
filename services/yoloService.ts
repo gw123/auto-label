@@ -1,4 +1,4 @@
-import { BBox, DatasetImage, LabelClass, YOLOConfig } from '../types';
+import { BBox, LabelClass, YOLOConfig } from '../types';
 
 // Convert normalized center coordinates (YOLO) to SVG rect coordinates (top-left)
 export const yoloToSvg = (bbox: BBox, imgWidth: number, imgHeight: number) => {

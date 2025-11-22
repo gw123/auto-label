@@ -1,17 +1,17 @@
 import { GoogleGenAI } from "@google/genai";
-import { DatasetImage, BBox, LabelClass, AIModel, ModelProvider } from "../types";
+import { BBox, LabelClass, AIModel, ModelProvider, LoadedImage } from "../types";
 
 type LogFn = (msg: string, type?: 'info' | 'success' | 'error' | 'warning') => void;
 
-// --- Helper: Image to Base64 ---
-const imageToBase64 = async (url: string): Promise<string> => {
-  const response = await fetch(url);
-  const blob = await response.blob();
+// --- Helper: Image/Blob to Base64 ---
+const blobToBase64 = (blob: Blob): Promise<string> => {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => {
-      const base64String = (reader.result as string).split(',')[1];
-      resolve(base64String);
+      const res = reader.result as string;
+      // Remove data URL prefix if present (e.g. "data:image/jpeg;base64,")
+      const base64 = res.split(',')[1]; 
+      resolve(base64);
     };
     reader.onerror = reject;
     reader.readAsDataURL(blob);
@@ -161,7 +161,7 @@ export const testModelConnection = async (model: AIModel): Promise<boolean> => {
 };
 
 export const autoLabelImage = async (
-  image: DatasetImage,
+  image: LoadedImage,
   activeLabels: LabelClass[],
   model: AIModel,
   sysApiKey?: string, // Fallback for default google models using env
@@ -170,8 +170,8 @@ export const autoLabelImage = async (
   try {
     onLog?.(`Starting analysis for image: ${image.name}`, 'info');
     
-    onLog?.(`Encoding image to Base64...`, 'info');
-    const base64Data = await imageToBase64(image.url);
+    onLog?.(`Encoding image Blob to Base64...`, 'info');
+    const base64Data = await blobToBase64(image.blob);
     onLog?.(`Image encoded. Size: ${Math.round(base64Data.length / 1024)}KB`, 'info');
 
     const labelsList = activeLabels.map(l => l.name).join(', ');
@@ -234,7 +234,7 @@ export const autoLabelImage = async (
 };
 
 export const analyzeImageForSpecificLabel = async (
-    image: DatasetImage,
+    image: LoadedImage,
     targetLabel: LabelClass,
     model: AIModel,
     sysApiKey?: string,
